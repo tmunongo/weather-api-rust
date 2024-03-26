@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 axum = "0.7.5"
-serde = "1.0.197"
+reqwest = { version = "0.12.2", features=["json"] }
+serde = { version = "1.0.197", features=["derive"] }
 tokio = { version = "1.36.0", features = ["rt", "rt-multi-thread"] }
 tokio-test = "0.4.4"
