@@ -6,3 +6,6 @@ test:
 
 fmt:
 	cargo fmt
+
+build:
+	cargo build
