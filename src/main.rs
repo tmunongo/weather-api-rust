@@ -1,19 +1,37 @@
 use std::env;
 
 use axum::{
-    extract::Path, http::StatusCode, routing::get, Router
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+    Router,
 };
+use bb8::Pool;
+use bb8_redis::RedisConnectionManager;
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() {
-    // tracing_subscriber::fmt::init();
+    tracing::debug!("connecting to redis");
+    let manager = RedisConnectionManager::new("redis://127.0.0.1").unwrap();
+    let pool = bb8::Pool::builder().build(manager).await.unwrap();
+
+    {
+        // ping the database before starting
+        let mut conn = pool.get().await.unwrap();
+        conn.set::<&str, &str, ()>("foo", "bar").await.unwrap();
+        let result: String = conn.get("foo").await.unwrap();
+        assert_eq!(result, "bar");
+    }
+    tracing::debug!("successfully connected to redis and pinged it");
 
     let app = Router::new()
         .route("/", get(index))
         .route("/weather/:city", get(city_weather))
-        .route("/health", get(|| async { StatusCode::OK }));
+        .route("/health", get(|| async { StatusCode::OK }))
+        .with_state(pool);
 
     let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
     println!("listening on {}", listener.local_addr().unwrap());
@@ -24,18 +42,57 @@ async fn index() -> &'static str {
     "Hello World"
 }
 
-async fn city_weather(Path(city): Path<String>) -> String {
+type ConnectionPool = Pool<RedisConnectionManager>;
+
+async fn city_weather(State(pool): State<ConnectionPool>, Path(city): Path<String>) -> String {
     let api_key = env::var("WEATHER_API_KEY").expect("WEATHER_API_KEY must be set");
 
-    let request_string = format!("http://api.weatherapi.com/v1/current.json?key={}&q={}&aqi=no", api_key, city);
+    // check redis for the weather data
+    let mut conn = pool.get().await.unwrap();
+    let cached_weather = conn
+        .get::<&std::string::String, Option<std::string::String>>(&city.to_lowercase())
+        .await
+        .unwrap();
 
-    let response = reqwest::get(request_string)
-    .await
-    .unwrap();
+    let body: WeatherResponse;
 
-    let body: WeatherResponse = response.json::<WeatherResponse>().await.unwrap();
+    match cached_weather {
+        Some(cached) => {
+            return format!(
+                "Weather for {} was retrieved from cache: {:?}",
+                city,
+                serde_json::from_str::<WeatherResponse>(&cached).unwrap(),
+            )
+        }
+        None => {
+            let request_string = format!(
+                "http://api.weatherapi.com/v1/current.json?key={}&q={}&aqi=no",
+                api_key, city
+            );
 
-    format!("Weather for {:?}", body)
+            let response = reqwest::get(request_string).await.unwrap();
+
+            body = response.json::<WeatherResponse>().await.unwrap();
+
+            let cached_body = conn
+                .set::<&std::string::String, std::string::String, Option<std::string::String>>(
+                    &body.location.name,
+                    serde_json::to_string(&body).unwrap(),
+                )
+                .await
+                .unwrap();
+
+            match cached_body {
+                Some(cached) => {
+                    return format!(
+                        "Weather for {} was cached as {:?}",
+                        body.location.name, serde_json::to_string(&cached).unwrap()
+                    )
+                }
+                None => return format!("Weather for {} was not cached", body.location.name),
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -53,7 +110,7 @@ struct Location {
     lon: f64,
     tz_id: String,
     localtime_epoch: i64,
-    localtime: String
+    localtime: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
