@@ -8,12 +8,15 @@ use axum::{
 };
 use bb8::Pool;
 use bb8_redis::RedisConnectionManager;
+use dotenvy::dotenv;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() {
+    dotenv().expect("Failed to load .env file");
+
     tracing::debug!("connecting to redis");
     let manager = RedisConnectionManager::new("redis://127.0.0.1").unwrap();
     let pool = bb8::Pool::builder().build(manager).await.unwrap();
@@ -45,52 +48,51 @@ async fn index() -> &'static str {
 type ConnectionPool = Pool<RedisConnectionManager>;
 
 async fn city_weather(State(pool): State<ConnectionPool>, Path(city): Path<String>) -> String {
-    let api_key = env::var("WEATHER_API_KEY").expect("WEATHER_API_KEY must be set");
+    let api_key = env::var("WEATHER_API_KEY").expect("WEATHER_API_KEY must be set!");
 
     // check redis for the weather data
     let mut conn = pool.get().await.unwrap();
     let cached_weather = conn
-        .get::<&std::string::String, Option<std::string::String>>(&city.to_lowercase())
+        .get::<String, Option<String>>(city.as_str().to_owned())
         .await
         .unwrap();
 
     let body: WeatherResponse;
 
-    match cached_weather {
-        Some(cached) => {
-            return format!(
-                "Weather for {} was retrieved from cache: {:?}",
-                city,
-                serde_json::from_str::<WeatherResponse>(&cached).unwrap(),
+    if cached_weather.is_some() {
+        return format!(
+            "Weather for {} was retrieved from cache: {:?}",
+            city,
+            serde_json::from_str::<WeatherResponse>(&cached_weather.unwrap()).unwrap(),
+        );
+    } else {
+        let request_string = format!(
+            "http://api.weatherapi.com/v1/current.json?key={}&q={}&aqi=no",
+            api_key, city
+        );
+
+        let response = reqwest::get(request_string).await.unwrap();
+
+        body = response.json::<WeatherResponse>().await.unwrap();
+
+        let cached_body = conn
+            .set_ex::<&str, String, Option<String>>(
+                &body.location.name.to_ascii_lowercase(),
+                serde_json::to_string(&body).unwrap(),
+                3600,
             )
-        }
-        None => {
-            let request_string = format!(
-                "http://api.weatherapi.com/v1/current.json?key={}&q={}&aqi=no",
-                api_key, city
-            );
+            .await
+            .unwrap();
 
-            let response = reqwest::get(request_string).await.unwrap();
-
-            body = response.json::<WeatherResponse>().await.unwrap();
-
-            let cached_body = conn
-                .set::<&std::string::String, std::string::String, Option<std::string::String>>(
-                    &body.location.name,
-                    serde_json::to_string(&body).unwrap(),
+        match cached_body {
+            Some(cached) => {                
+                return format!(
+                    "Weather for {} was cached as {:?}",
+                    body.location.name,
+                    cached
                 )
-                .await
-                .unwrap();
-
-            match cached_body {
-                Some(cached) => {
-                    return format!(
-                        "Weather for {} was cached as {:?}",
-                        body.location.name, serde_json::to_string(&cached).unwrap()
-                    )
-                }
-                None => return format!("Weather for {} was not cached", body.location.name),
             }
+            None => return format!("Weather for {} was not cached", body.location.name),
         }
     }
 }
